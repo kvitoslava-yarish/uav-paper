@@ -1,97 +1,92 @@
 
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+class DetectionHead(nn.Module):
+    def __init__(self, in_channels, num_classes=1, dropout_rate=0.5):
+        super().__init__()
+        self.shared_convs = nn.Sequential(
+            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU()
+        )
+        shared_conv_out_channels = 256 
+        self.cls_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(shared_conv_out_channels * 1 * 1, 256),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(256, num_classes)
+        )
+        self.box_reg_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(shared_conv_out_channels * 1 * 1, 256),
+            nn.ReLU(),
+            nn.Linear(256, 4)
+        )
+        self._init_weights()
 
-class FlatInfraredDatasetOpticalFlow(Dataset):
-    def __init__(self, json_path, image_dir, transform=None, target_size=(256, 256)):
-        with open(json_path, "r") as f:
-            data = json.load(f)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                else:
+                    nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-        self.exists = data["exist"]
-        self.bboxes = data["gt_rect"]
-        self.image_dir = image_dir
+    def forward(self, x):
+        shared_features = self.shared_convs(x)
+        class_logits = self.cls_branch(shared_features)
+        box_preds = self.box_reg_branch(shared_features)
+        return class_logits, box_preds
 
-        if transform is None:
-            self.transform = T.Compose([
-                T.ToTensor(),
-                T.Normalize(mean=[0.5], std=[0.5])
-            ])
-        else:
-            self.transform = transform
+class EfficientNetDetectorOpticalFlow(nn.Module):
+    def __init__(self, backbone_name='efficientnet_b1', num_classes=2):
+        super().__init__()
+        
+        self.backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
 
-        self.image_files = sorted(os.listdir(image_dir), key=natural_sort_key)
+        original_first_conv = self.backbone.conv_stem 
+        
+        self.backbone.conv_stem = nn.Conv2d(
+            in_channels=5,
+            out_channels=original_first_conv.out_channels,
+            kernel_size=original_first_conv.kernel_size,
+            stride=original_first_conv.stride,
+            padding=original_first_conv.padding,
+            bias=original_first_conv.bias is not None
+        )
+        
+        with torch.no_grad():
+            avg_original_weights = original_first_conv.weight.mean(dim=1, keepdim=True)
+            
+            self.backbone.conv_stem.weight[:, 0:1, :, :] = avg_original_weights.clone()
+            
+            self.backbone.conv_stem.weight[:, 1:, :, :] = avg_original_weights.repeat(1, 4, 1, 1)
 
-        self.orig_width = 640
-        self.orig_height = 512
-        self.target_width, self.target_height = target_size
+            if original_first_conv.bias is not None:
+                self.backbone.conv_stem.bias.copy_(original_first_conv.bias)
 
-        self.valid_data_indices = []
-        for i in range(len(self.image_files)):
-            if self.exists[i] == 1:
-                if i >= 2:
-                    self.valid_data_indices.append(i)
+        self.feature_channels = self.backbone.feature_info[-1]['num_chs']
 
-        print(f"Found {len(self.valid_data_indices)} valid sequences for detection with optical flow.")
+        self.detector_head = DetectionHead(
+            in_channels=self.feature_channels,
+            num_classes=num_classes
+        )
 
-    def __len__(self):
-        return len(self.valid_data_indices)
+    def forward(self, x):
+        feature_map = self.backbone(x)[-1]
+        class_logits, bbox_preds = self.detector_head(feature_map)
+        return class_logits, bbox_preds
 
-    def __getitem__(self, idx):
-        frame_n_overall_idx = self.valid_data_indices[idx]
-
-        filename_n = self.image_files[frame_n_overall_idx]
-        filename_n_minus_1 = self.image_files[frame_n_overall_idx - 1]
-        filename_n_minus_2 = self.image_files[frame_n_overall_idx - 2]
-
-        bbox = self.bboxes[frame_n_overall_idx]
-        x, y, w, h = bbox
-
-        img_n_minus_2_pil = Image.open(os.path.join(self.image_dir, filename_n_minus_2)).convert('L')
-        img_n_minus_1_pil = Image.open(os.path.join(self.image_dir, filename_n_minus_1)).convert('L')
-        img_n_pil = Image.open(os.path.join(self.image_dir, filename_n)).convert('L')
-
-        size_tuple = (self.target_width, self.target_height)
-        img_n_minus_2_resized_pil = img_n_minus_2_pil.resize(size_tuple)
-        img_n_minus_1_resized_pil = img_n_minus_1_pil.resize(size_tuple)
-        img_n_resized_pil = img_n_pil.resize(size_tuple)
-
-        frame_0_np = np.array(img_n_minus_2_resized_pil)
-        frame_1_np = np.array(img_n_minus_1_resized_pil)
-        frame_2_np = np.array(img_n_resized_pil)
-
-        flow_01 = cv2.calcOpticalFlowFarneback(frame_0_np, frame_1_np, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        flow_12 = cv2.calcOpticalFlowFarneback(frame_1_np, frame_2_np, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-
-        max_flow_val = 20.0
-
-        flow_01_tensor = torch.from_numpy(flow_01).permute(2, 0, 1).float()
-        flow_12_tensor = torch.from_numpy(flow_12).permute(2, 0, 1).float()
-
-        flow_01_tensor = torch.clamp(flow_01_tensor / max_flow_val, -1.0, 1.0)
-        flow_12_tensor = torch.clamp(flow_12_tensor / max_flow_val, -1.0, 1.0)
-
-        img_n_tensor = self.transform(img_n_resized_pil)
-
-        combined_input_tensor = torch.cat([img_n_tensor, flow_01_tensor, flow_12_tensor], dim=0)
-
-        x1_scaled = x * self.target_width / self.orig_width
-        y1_scaled = y * self.target_height / self.orig_height
-        x2_scaled = (x + w) * self.target_width / self.orig_width
-        y2_scaled = (y + h) * self.target_height / self.orig_height
-
-        x1_norm = max(0.0, min(1.0, x1_scaled / self.target_width))
-        y1_norm = max(0.0, min(1.0, y1_scaled / self.target_height))
-        x2_norm = max(0.0, min(1.0, x2_scaled / self.target_width))
-        y2_norm = max(0.0, min(1.0, y2_scaled / self.target_height))
-
-        target = {
-            "boxes": torch.tensor([[x1_norm, y1_norm, x2_norm, y2_norm]], dtype=torch.float32),
-            "labels": torch.tensor([1], dtype=torch.int64)
-        }
-
-        return combined_input_tensor, target
-
-
+model = EfficientNetDetectorOpticalFlow()
 weights_path = "detector_model_optical_epoch_4.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
