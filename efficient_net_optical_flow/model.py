@@ -85,19 +85,3 @@ class EfficientNetDetectorOpticalFlow(nn.Module):
         feature_map = self.backbone(x)[-1]
         class_logits, bbox_preds = self.detector_head(feature_map)
         return class_logits, bbox_preds
-
-model = EfficientNetDetectorOpticalFlow()
-weights_path = "detector_model_optical_epoch_4.pth"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-try:
-    checkpoint = torch.load(weights_path, map_location=device)
-    model.load_state_dict(checkpoint)
-    model.to(device)
-    model.eval()
-    print(f"Model weights loaded successfully from {weights_path} to {device}.")
-
-except FileNotFoundError:
-    print(f"Error: The file '{weights_path}' was not found.")
-except Exception as e:
-    print(f"An error occurred while loading weights: {e}")
