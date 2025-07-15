@@ -65,19 +65,4 @@ class DetectionHead(nn.Module):
         return class_logits, box_preds
 
 
-model = EfficientNetDetector()
 
-weights_path = "detector_model_epoch_3.pth"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-try:
-    checkpoint = torch.load(weights_path, map_location=device)
-    model.load_state_dict(checkpoint)
-    model.to(device)
-    model.eval()
-    print(f"Model weights loaded successfully from {weights_path} to {device}.")
-
-except FileNotFoundError:
-    print(f"Error: The file '{weights_path}' was not found.")
-except Exception as e:
-    print(f"An error occurred while loading weights: {e}")
